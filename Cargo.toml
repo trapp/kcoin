@@ -1,0 +1,23 @@
+[package]
+name = "kcoin"
+version = "0.1.0"
+authors = ["timon"]
+
+[dependencies]
+env_logger = "0.5.13"
+serde_json = "1.0.26"
+serde = "1.0.80"
+serde_derive = "1.0.80"
+clap = "2.32.0"
+log = "0.4.4"
+rusqlite = "0.15.0"
+failure = "0.1.2"
+dirs = "1.0"
+r2d2 = "0.8.2"
+r2d2_sqlite = "0.7.0"
+futures = "0.1.25"
+bech32 = "0.5.0"
+ed25519-dalek = "0.8.1"
+sha2 = "0.7.0"
+hex = "0.3.2"
+jsonrpc-minihttp-server = { git = "https://github.com/paritytech/jsonrpc" }
