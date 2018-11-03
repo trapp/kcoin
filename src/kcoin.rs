@@ -11,8 +11,8 @@ use serde_json;
 use std::num::ParseIntError;
 use bech32::{Bech32, convert_bits};
 use ed25519_dalek::PublicKey;
-use std::vec::Vec;
-
+use std::thread;
+use std::time;
 use jsonrpc_minihttp_server::{ServerBuilder, DomainsValidation};
 use jsonrpc_minihttp_server::jsonrpc_core::{Params, Value, IoHandler, Compatibility, Error};
 use jsonrpc_minihttp_server::cors::AccessControlAllowOrigin;
@@ -205,6 +205,23 @@ pub fn init() -> Result<(), KCoinError> {
         let network_clone = network.clone();
         io.add_method("tx_send", move |params| {
             rpccalls::tx::tx_send(&storage_clone, &network_clone, param_map(params)?)
+        });
+    }
+
+    {
+        let block_gen_storage = storage.clone();
+        let block_gen_thread = thread::spawn(move || {
+            const BLOCK_SIZE: u64 = 2;
+            loop {
+                let ten_seconds = time::Duration::from_millis(30000);
+                thread::sleep(ten_seconds);
+
+                println!("gen block");
+
+                // fetch mempool txs ordered by fee limit block size
+
+                //
+            }
         });
     }
 

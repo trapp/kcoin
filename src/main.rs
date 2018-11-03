@@ -1,5 +1,4 @@
 #[macro_use] extern crate serde_derive;
-#[macro_use] extern crate serde;
 #[macro_use] extern crate serde_json;
 #[macro_use] extern crate log;
 #[macro_use] extern crate failure;
@@ -15,11 +14,13 @@ extern crate futures;
 extern crate bech32;
 extern crate ed25519_dalek;
 extern crate sha2;
+extern crate time;
 
 mod rpccalls;
 mod errors;
 mod storage;
 mod kcoin;
+mod tx;
 
 fn main() {
     match kcoin::init() {
