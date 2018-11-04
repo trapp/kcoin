@@ -5,11 +5,10 @@ use ::errors;
 use jsonrpc_minihttp_server::jsonrpc_core::*;
 use storage::SqliteStorage;
 
+use kcoin;
 use ::kcoin::Network;
 use ::tx::TransactionEnvelope;
 use ::storage;
-
-const MEMPOOL_SIZE: u64 = 10;
 
 pub fn tx_send(storage: &SqliteStorage, network: &Network, params: serde_json::Map<String, Value>) -> Result<Value> {
     debug!("Received call to tx_send");
@@ -30,6 +29,46 @@ pub fn tx_send(storage: &SqliteStorage, network: &Network, params: serde_json::M
     if storage.mempool_exists(&tx.hash).map_err(internal_error)? == true {
         return Err(errors::tx_known());
     }
+
+    let coin_exists = storage.coin_exists(&tx.tx.coin).map_err(internal_error)?;
+    println!("coin exists {:?}", coin_exists);
+    if !coin_exists && tx.tx.fee < kcoin::NEW_COIN_FEE {
+        return Err(errors::fee_too_low());
+    }
+
+    let address_balance = match storage.address_get_balance(&tx.tx.from.address, &tx.tx.coin).map_err(internal_error)? {
+        Some(v) => v,
+        None => 0
+    };
+    println!("address balance {:?}", address_balance);
+
+    let reserved_balance = match storage.address_get_reserved_balance(&tx.tx.from.address, &tx.tx.coin).map_err(internal_error)? {
+        Some(v) => v,
+        None => 0
+    };
+    println!("reserved balance {:?}", reserved_balance);
+
+    let knc_address_balance = match tx.tx.coin.as_ref() {
+        "KCN" => address_balance,
+        _ => {
+            match storage.address_get_balance(&tx.tx.from.address, "KCN").map_err(internal_error)? {
+                Some(v) => v,
+                None => 0
+            }
+        }
+    };
+    println!("knc address balance {:?}", knc_address_balance);
+
+    let knc_reserved_balance = match tx.tx.coin.as_ref() {
+        "KCN" => reserved_balance,
+        _ => {
+            match storage.address_get_reserved_balance(&tx.tx.from.address, "KCN").map_err(internal_error)? {
+                Some(v) => v,
+                None => 0
+            }
+        }
+    };
+    println!("knc reserved balance {:?}", knc_reserved_balance);
 
     let nonce_chain = storage.address_nonce_mined(&tx.tx.from).map_err(internal_error)?;
     println!("address chain nonce {:?}", nonce_chain);
@@ -69,6 +108,16 @@ pub fn tx_send(storage: &SqliteStorage, network: &Network, params: serde_json::M
         if current_tx.tx.fee >= tx.tx.fee {
             return Err(errors::fee_too_low_to_replace());
         }
+
+        // check if he has enough balance if we replace the tx with the new one.
+        if (&tx.tx.coin == "KCN" && address_balance < reserved_balance - current_tx.tx.fee - current_tx.tx.amount + tx.tx.fee + tx.tx.amount)
+                || (coin_exists && &tx.tx.coin != "KCN" && address_balance < reserved_balance - current_tx.tx.amount + tx.tx.amount
+                    || knc_address_balance < knc_reserved_balance - current_tx.tx.fee + tx.tx.fee
+                )
+             {
+            return Err(errors::insufficient_balance());
+        }
+
         // delete existing tx from mempool. adding the new one happens after this if statement.
         storage.mempool_remove(&current_tx.hash).map_err(internal_error)?;
         storage.mempool_add(&tx).map_err(internal_error)?;
@@ -77,8 +126,8 @@ pub fn tx_send(storage: &SqliteStorage, network: &Network, params: serde_json::M
     }
 
     let mempool_count = storage.mempool_count().map_err(internal_error)?;
-    println!("{:?}", mempool_count);
-    if mempool_count >= MEMPOOL_SIZE {
+    println!("mempool count {:?}", mempool_count);
+    if mempool_count >= ::kcoin::MEMPOOL_SIZE.into() {
         // Mempool is full. See if it's worth it to evict another tx for this one.
         // To calculate this, we take the sum of all fees per address currently in the
         // mempool and compare that to the new tx's fee. If the fee value of the new tx is
@@ -106,12 +155,24 @@ pub fn tx_send(storage: &SqliteStorage, network: &Network, params: serde_json::M
             }
             None => {
                 // Apparently the mempool is completely filled with transactions of this sender
-                // himself. Since he can't evict his own lower-nonce transactions deny his new
-                // transaction.
+                // himself. Since he can't evict his own lower-nonce transactions without creating
+                // a gap, deny his new transaction.
                 return Err(errors::mempool_full_own_txs());
             }
         };
     }
+
+    // check balance
+    if (&tx.tx.coin == "KCN" && address_balance < reserved_balance + tx.tx.fee + tx.tx.amount)
+        || (coin_exists && &tx.tx.coin != "KCN" && address_balance < reserved_balance + tx.tx.amount
+                || knc_address_balance < knc_reserved_balance + tx.tx.fee
+            )
+         {
+        return Err(errors::insufficient_balance());
+    }
+
+    println!("balance comp {:?} {:?}", &tx.tx.coin == "KCN" && address_balance < reserved_balance + tx.tx.fee + tx.tx.amount, &tx.tx.coin != "KCN" && address_balance < reserved_balance + tx.tx.amount
+        && knc_address_balance < knc_reserved_balance + tx.tx.fee);
 
     storage.mempool_add(&tx).map_err(internal_error)?;
 

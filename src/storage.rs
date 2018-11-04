@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use kcoin::Bech32Address;
 use rusqlite;
 use rusqlite::Row;
-use ::tx::{TransactionEnvelope, Transaction};
+use tx::{TransactionEnvelope, Transaction, MinedTx};
+use block::Block;
 use ::kcoin::Network;
 use std::convert::From;
 use time::Timespec;
@@ -17,6 +18,18 @@ use time::Timespec;
 pub enum Error {
     #[fail(display = "cannot open db")]
     CannotOpenDb,
+    #[fail(display = "cannot start transaction {}", message)]
+    CannotStartTransaction {
+        message: String
+    },
+    #[fail(display = "cannot commit transaction {}", message)]
+    CannotCommitTransaction {
+        message: String
+    },
+    #[fail(display = "cannot rollback transaction {}", message)]
+    CannotRollbackTransaction {
+        message: String
+    },
     #[fail(display = "cannot claim a db connection")]
     CannotClaimDbConnection,
     #[fail(display = "datadir not writeable")]
@@ -37,6 +50,7 @@ pub enum Error {
 
 impl From<rusqlite::Error> for Error {
     fn from(error: rusqlite::Error) -> Self {
+        println!("converting {:?}", error);
         match error {
             rusqlite::Error::QueryReturnedNoRows => Error::NotFound,
             _ => Error::QueryError {message: error.to_string()}
@@ -51,7 +65,8 @@ impl From<::kcoin::KCoinError> for Error {
 }
 
 pub struct SqliteStorage {
-    pool: Pool<SqliteConnectionManager>
+    pool: Pool<SqliteConnectionManager>,
+    knc_address: Bech32Address
 }
 
 impl SqliteStorage {
@@ -82,9 +97,10 @@ impl SqliteStorage {
                 CREATE UNIQUE INDEX IF NOT EXISTS `block_hash` ON `block`(`hash`);
                 CREATE INDEX IF NOT EXISTS `block_time` ON `block`(`time`);
 
-                CREATE TABLE IF NOT EXISTS `transaction` (`hash` TEXT, `signature` TEXT, `block` INTEGER, `seen` INTEGER, `from` TEXT, `to` TEXT, `coin` TEXT, `amount` BIGINT, `nonce` BIGINT, `fee` BIGINT, `memo` TEXT);
+                CREATE TABLE IF NOT EXISTS `transaction` (`hash` TEXT, `signature` TEXT, `block` INTEGER, `index` INTEGER, `seen` INTEGER, `from` TEXT, `to` TEXT, `coin` TEXT, `amount` BIGINT, `nonce` BIGINT, `fee` BIGINT, `memo` TEXT);
                 CREATE UNIQUE INDEX IF NOT EXISTS `tx_hash` ON `transaction`(`hash`);
                 CREATE INDEX IF NOT EXISTS `tx_block` ON `transaction`(`block`);
+                CREATE INDEX IF NOT EXISTS `tx_index` ON `transaction`(`index`);
                 CREATE INDEX IF NOT EXISTS `tx_from` ON `transaction`(`from`);
                 CREATE INDEX IF NOT EXISTS `tx_to` ON `transaction`(`to`);
                 CREATE INDEX IF NOT EXISTS `tx_coin` ON `transaction`(`coin`);
@@ -118,10 +134,10 @@ impl SqliteStorage {
         if count == 0 {
             conn.execute("INSERT INTO address_balance (`address`, `coin`, `balance`)
                   VALUES (?1, ?2, ?3)",
-                     &[knc_address.address, "KCN".to_owned(), (knc_supply * 100000000).to_string()]).unwrap();
+                     &[&knc_address.address, "KCN", &(knc_supply * 100000000).to_string()]).unwrap();
         }
 
-        Ok(SqliteStorage {pool})
+        Ok(SqliteStorage {pool, knc_address: knc_address})
     }
 
     pub fn get_conn(&self) -> Result<PooledConnection<SqliteConnectionManager>, Error> {
@@ -130,19 +146,26 @@ impl SqliteStorage {
 
     pub fn clone(&self) -> Self {
         SqliteStorage {
-            pool: self.pool.clone()
+            pool: self.pool.clone(),
+            knc_address: self.knc_address.clone()
         }
     }
 
     pub fn block_height(&self) -> Result<u32, Error> {
-        let conn = self.pool.get().map_err(|_| Error::CannotOpenDb)?;
+        let conn = self.get_conn()?;
         let mut stmt = conn
             .prepare("SELECT `height` FROM `block` ORDER BY height DESC LIMIT 1")
             .map_err(|e| Error::QueryError {message: e.to_string()})?;
 
-        let height: u32 = stmt
-            .query_row(NO_PARAMS, |row| row.get(0))
-            .map_err(|e| Error::QueryError {message: e.to_string()})?;
+        let height: u32 = match stmt.query_row(NO_PARAMS, |row| row.get(0)) {
+            Ok(v) => v,
+            Err(e) => {
+                match e {
+                    rusqlite::Error::QueryReturnedNoRows => 0,
+                    _ => return Err(Error::QueryError {message: e.to_string()})
+                }
+            }
+        };
         Ok(height)
     }
 
@@ -194,6 +217,19 @@ impl SqliteStorage {
 
     pub fn mempool_remove(&self, hash: &str) -> Result<(), Error> {
         let conn = self.get_conn()?;
+        conn.execute(
+            "DELETE FROM `mempool` WHERE `hash` = ?1",
+            &[
+                hash
+            ],
+        ).map_err(|e| {
+            println!("{:?}", e);
+            Error::QueryError {message: "delete failed".to_owned()}
+        })?;
+        Ok(())
+    }
+
+    pub fn mempool_remove_with_conn(&self, conn: &rusqlite::Connection, hash: &str) -> Result<(), Error> {
         conn.execute(
             "DELETE FROM `mempool` WHERE `hash` = ?1",
             &[
@@ -331,6 +367,294 @@ impl SqliteStorage {
             })?;
 
         Ok(result == 1)
+    }
+
+    pub fn balance_sanity_check_with_conn(&self, conn: &rusqlite::Connection) -> Result<(), Error> {
+        let mut stmt = conn
+            .prepare("SELECT count(*) FROM `address_balance` WHERE `balance` < 0 LIMIT 1")
+            .map_err(|e| Error::QueryError {message: e.to_string()})?;
+
+        let result: u32 = stmt
+            .query_row(NO_PARAMS, |row| {
+                row.get(0)
+            })
+            .map_err(|e| {
+                Error::QueryError {message: e.to_string()}
+            })?;
+
+        if result > 0 {
+            Err(Error::InternalError)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn mempool_get_block_candidates(&self, network: &Network) -> Result<Vec<TransactionEnvelope>, Error> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn
+            .prepare("SELECT `amount`, `coin`, `fee`, `from`, `hash`, `memo`, `nonce`, `seen`, `signature`, `to` \
+                      FROM `mempool` m \
+                      ORDER BY (nonce - ifnull((select nonce from `transaction` t where m.`from` = t.`from` order by nonce desc limit 1), 0)) ASC, fee DESC \
+                      LIMIT ?1")
+            .map_err(|e| Error::QueryError {message: e.to_string()})?;
+
+        //select * from mempool m order by (nonce - ifnull((select nonce from `transaction` t where m."from" = t."from" order by nonce desc limit 1), 0)) ASC, fee desc;
+        let rows = stmt
+            .query_and_then(
+                &[::kcoin::BLOCK_SIZE],
+                |row| {
+                    SqliteStorage::tx_from_row(row, network)
+                })?;
+
+        let mut txs = Vec::new();
+        for tx in rows {
+            txs.push(tx?);
+        }
+        Ok(txs)
+    }
+
+    pub fn start_transaction(&self, conn: &rusqlite::Connection) -> Result<(), Error> {
+        println!("start tx {:?}", conn.is_autocommit());
+        let res = conn.execute_batch("BEGIN DEFERRED").map_err(|e| Error::CannotStartTransaction { message: e.to_string() });
+        println!("start tx {:?}", conn.is_autocommit());
+        res
+    }
+
+    pub fn commit_transaction(&self, conn: &rusqlite::Connection) -> Result<(), Error> {
+        conn.execute_batch("COMMIT").map_err(|e| Error::CannotCommitTransaction { message: e.to_string() })
+    }
+
+    pub fn rollback_transaction(&self, conn: &rusqlite::Connection) -> Result<(), Error> {
+        conn.execute_batch("ROLLBACK").map_err(|e| Error::CannotRollbackTransaction { message: e.to_string() })
+    }
+
+    pub fn transaction_insert_with_conn(&self, conn: &rusqlite::Connection, block: u32, index: u32, transaction: &TransactionEnvelope) -> Result<(), Error> {
+        // `hash` TEXT, `signature` TEXT, `block` INTEGER, `seen` INTEGER, `from` TEXT, `to` TEXT,
+        //`coin` TEXT, `amount` BIGINT, `nonce` BIGINT, `fee` BIGINT, `memo` TEXT);
+
+        println!("inserting tx {:?}", transaction);
+        println!("autocommit {:?}", conn.is_autocommit());
+        let tx_inserted_rows = conn.execute(
+            "INSERT INTO `transaction` (`hash`, `signature`, `block`, `index`, `seen`, `from`, `to`, `coin`, `amount`, `nonce`, `fee`, `memo`)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            &[
+                &transaction.hash,
+                &transaction.signature,
+                &block.to_string(),
+                &index.to_string(),
+                &transaction.seen.sec.to_string(),
+                &transaction.tx.from.address.to_string(),
+                &transaction.tx.to.address.to_string(),
+                &transaction.tx.coin.to_string(),
+                &transaction.tx.amount.to_string(),
+                &transaction.tx.nonce.to_string(),
+                &transaction.tx.fee.to_string(),
+                &transaction.tx.memo.to_string()
+            ],
+        ).map_err(|e| {
+            println!("{:?}", e);
+            Error::QueryError {message: "insert tx failed".to_owned()}
+        })?;
+        if tx_inserted_rows == 0 {
+            return Err(Error::QueryError {message: "unable to insert tx".to_owned()});
+        }
+
+        println!("autocommit after inserting tx {:?}", conn.is_autocommit());
+
+        // Deduct fee from balance of sender
+        let fee_from_changed = conn.execute(
+            "UPDATE `address_balance` SET `balance` = `balance` - ?1 WHERE `address` = ?2 AND `coin` = 'KCN'",
+            &[
+                &(transaction.tx.fee).to_string(),
+                &transaction.tx.from.address.to_string()
+            ],
+        ).map_err(|e| {
+            println!("{:?}", e);
+            Error::QueryError {message: "unable to deduct fee from senders balance".to_owned()}
+        })?;
+        if fee_from_changed == 0 {
+            return Err(Error::QueryError {message: "unable to deduct fee from senders balance".to_owned()});
+        }
+
+        // Deduct amount from balance of sender
+        let from_changed = conn.execute(
+            "UPDATE `address_balance` SET `balance` = `balance` - ?1 WHERE `address` = ?2 AND `coin` = ?3",
+            &[
+                &(transaction.tx.amount).to_string(),
+                &transaction.tx.from.address.to_string(),
+                &transaction.tx.coin.to_string()
+            ],
+        ).map_err(|e| {
+            println!("{:?}", e);
+            Error::QueryError {message: "insert tx failed".to_owned()}
+        })?;
+        if from_changed == 0 && self.coin_exists_in_chain(&transaction.tx.coin)? {
+            return Err(Error::QueryError {message: "sender has not enough balance".to_owned()});
+        }
+
+        println!("autocommit after updating sender balance {:?}", conn.is_autocommit());
+
+        // Add amount to receivers balance
+        match self.address_get_balance(&transaction.tx.to.address, &transaction.tx.coin)? {
+            Some(_) => {
+                let to_changed = conn.execute(
+                    "UPDATE `address_balance` SET `balance` = `balance` + ?1 WHERE `address` = ?2 AND `coin` = ?3",
+                    &[
+                        &transaction.tx.amount.to_string(),
+                        &transaction.tx.to.address.to_string(),
+                        &transaction.tx.coin.to_string()
+                    ],
+                ).map_err(|e| {
+                    println!("{:?}", e);
+                    Error::QueryError {message: "insert tx failed".to_owned()}
+                })?;
+
+                if to_changed == 0 {
+                    return Err(Error::QueryError {message: "Unable to update receiver balance".to_owned()});
+                }
+            },
+            None => {
+                let to_changed = conn.execute(
+                    "INSERT INTO `address_balance` (`address`, `coin`, `balance`) VALUES (?1, ?2, ?3)",
+                    &[
+                        &transaction.tx.to.address,
+                        &transaction.tx.coin,
+                        &transaction.tx.amount.to_string()
+                    ],
+                ).map_err(|e| {
+                    println!("{:?}", e);
+                    Error::QueryError {message: "insert sender balance failed".to_owned()}
+                })?;
+
+                if to_changed == 0 {
+                    return Err(Error::QueryError {message: "Unable to insert receiver balance".to_owned()});
+                }
+            }
+        }
+
+        println!("autocommit after updating receiver balance {:?}", conn.is_autocommit());
+
+        let master_changed = conn.execute(
+            "UPDATE `address_balance` SET `balance` = `balance` + ?1 WHERE `address` = ?2 AND `coin` = 'KCN'",
+            &[
+                &transaction.tx.fee.to_string(),
+                &self.knc_address.address
+            ],
+        ).map_err(|e| {
+            println!("{:?}", e);
+            Error::QueryError {message: "update balance for master failed".to_owned()}
+        })?;
+
+        if master_changed == 0 {
+            return Err(Error::QueryError {message: "Unable to update kcn owner balance".to_owned()});
+        }
+
+        println!("autocommit after updating master balance {:?}", conn.is_autocommit());
+
+        Ok(())
+    }
+
+    pub fn address_get_balance(&self, address: &str, coin: &str) -> Result<Option<u64>, Error> {
+        let conn = self.get_conn()?;
+
+        match conn
+            .query_row_and_then(
+                "SELECT balance FROM `address_balance` where `address` = ?1 and `coin` = ?2",
+                &[address, coin],
+                |row| {
+                    SqliteStorage::i64_to_u64(row.get_checked(0)?)
+                }) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) => {
+                match e {
+                    Error::NotFound => Ok(None),
+                    _ => Err(Error::QueryError {message: e.to_string()})
+                }
+            }
+        }
+    }
+
+    pub fn address_get_reserved_balance(&self, address: &str, coin: &str) -> Result<Option<u64>, Error> {
+        let conn = self.get_conn()?;
+
+        match conn
+            .query_row_and_then(
+                "SELECT SUM(`amount`) + SUM(`fee`) as `reserved` FROM `mempool` where `from` = ?1 and `coin` = ?2 GROUP BY `from`, `coin` LIMIT 1",
+                &[address, coin],
+                |row| {
+                    SqliteStorage::i64_to_u64(row.get_checked(0)?)
+                }) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) => {
+                match e {
+                    Error::NotFound => Ok(None),
+                    _ => Err(Error::QueryError {message: e.to_string()})
+                }
+            }
+        }
+    }
+
+    pub fn coin_exists(&self, coin: &str) -> Result<bool, Error> {
+        Ok(self.coin_exists_in_chain(coin)? || self.coin_exists_in_mempool(coin)?)
+    }
+
+    pub fn coin_exists_in_chain(&self, coin: &str) -> Result<bool, Error> {
+        let conn = self.get_conn()?;
+
+        match conn
+            .query_row_and_then(
+                "SELECT `balance` from `address_balance` a where a.coin = ?1 LIMIT 1",
+                &[coin],
+                |row| {
+                    // value doesn't matter
+                    Ok(false)
+                }) {
+            Ok(v) => Ok(true),
+            Err(e) => {
+                match e {
+                    Error::NotFound => Ok(false),
+                    _ => Err(Error::QueryError {message: e.to_string()})
+                }
+            }
+        }
+    }
+
+    pub fn coin_exists_in_mempool(&self, coin: &str) -> Result<bool, Error> {
+        let conn = self.get_conn()?;
+
+        match conn
+            .query_row_and_then(
+                "SELECT `amount` from `mempool` m where m.coin = ?1 LIMIT 1",
+                &[coin],
+                |row| {
+                    // value doesn't matter
+                    Ok(false)
+                }) {
+            Ok(v) => Ok(true),
+            Err(e) => {
+                match e {
+                    Error::NotFound => Ok(false),
+                    _ => Err(Error::QueryError {message: e.to_string()})
+                }
+            }
+        }
+    }
+
+    pub fn block_add_with_conn(&self, conn: &rusqlite::Connection, block: &Block) -> Result<(), Error> {
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_err(|_| Error::InternalError)?.as_secs();
+        conn.execute(
+            "INSERT INTO `block` (`height`, `hash`, `time`)
+                  VALUES (?1, ?2, ?3)",
+            &[
+                &block.height.to_string(),
+                &block.hash,
+                &block.time.sec.to_string()
+            ],
+        ).map_err(|e| {
+            println!("{:?}", e);
+            Error::QueryError {message: "insert block failed".to_owned()}
+        })?;
+        Ok(())
     }
 
     fn i64_to_u64(num: i64) -> Result<u64, Error> {

@@ -7,6 +7,7 @@ use ::kcoin::Network;
 use time::Timespec;
 use hex;
 use time;
+use regex::Regex;
 
 #[derive(Debug, Fail)]
 pub enum Error {
@@ -22,7 +23,7 @@ pub enum Error {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct Transaction {
     pub amount: u64,
     pub coin: String,
@@ -63,6 +64,13 @@ pub struct TransactionEnvelope {
     pub tx: Transaction
 }
 
+#[derive(Debug)]
+pub struct MinedTx {
+    pub block: u32,
+    pub index: u32,
+    pub tx: TransactionEnvelope
+}
+
 impl TransactionEnvelope {
 
     fn field_as_str<'a>(json: &'a Map<String, Value>, field: &str) -> Result<&'a str, Error> {
@@ -94,15 +102,34 @@ impl TransactionEnvelope {
     }
 
     pub fn from_json(json: serde_json::Map<String, Value>, network: &Network) -> Result<Self, Error> {
+        lazy_static! {
+            static ref memo_regex: Regex = Regex::new(r"^[ -~]*$").unwrap();
+            static ref coin_regex: Regex = Regex::new(r"^[A-Z]+$").unwrap();
+        }
         let hash = TransactionEnvelope::field_as_str(&json, "hash")?.to_owned();
         let signature = TransactionEnvelope::field_as_str(&json, "signature")?.to_owned();
         let tx = TransactionEnvelope::field_as_object(&json, "tx")?;
         let amount = TransactionEnvelope::field_as_u64(&tx, "amount")?;
+        if amount == 0 || amount > i64::max_value() as u64 {
+            return Err(Error::InvalidField {field: "amount".to_owned()});
+        }
         let coin = TransactionEnvelope::field_as_str(&tx, "coin")?.to_owned();
+        if coin.len() < 3 || coin.len() > 4 || !coin_regex.is_match(&coin) {
+            return Err(Error::InvalidField {field: "coin".to_owned()});
+        }
         let fee = TransactionEnvelope::field_as_u64(&tx, "fee")?;
+        if fee > i64::max_value() as u64 {
+            return Err(Error::InvalidField {field: "fee".to_owned()});
+        }
         let from = TransactionEnvelope::field_as_address(&tx, network, "from")?;
         let memo = TransactionEnvelope::field_as_str(&tx, "memo")?.to_owned();
+        if memo.len() > 64 || !memo_regex.is_match(&memo) {
+            return Err(Error::InvalidField {field: "memo".to_owned()});
+        }
         let nonce = TransactionEnvelope::field_as_u64(&tx, "nonce")?;
+        if nonce > i64::max_value() as u64 {
+            return Err(Error::InvalidField {field: "nonce".to_owned()});
+        }
         let to = TransactionEnvelope::field_as_address(&tx, network, "to")?;
         let envelope = TransactionEnvelope {
             hash: hash,
@@ -133,15 +160,15 @@ impl TransactionEnvelope {
                 return false;
             }
         };
-        println!("public key {:?}", public_key);
-        println!("signature str {:?}", self.signature);
+        //println!("public key {:?}", public_key);
+        //println!("signature str {:?}", self.signature);
         let signature_as_bytes = match hex::decode(&self.signature) {
             Ok(t) => t,
             Err(_) => {
                 return false;
             }
         };
-        println!("signature bytes {:?}", signature_as_bytes);
+        //println!("signature bytes {:?}", signature_as_bytes);
         let signature = match Signature::from_bytes(&signature_as_bytes) {
             Ok(t) => t,
             Err(e) => {
@@ -149,7 +176,7 @@ impl TransactionEnvelope {
                 return false;
             }
         };
-        println!("signature parsed {:?}", signature);
+        //println!("signature parsed {:?}", signature);
         let signature_data = match self.tx.signature_data() {
             Ok(t) => t,
             Err(e) => {
@@ -157,7 +184,7 @@ impl TransactionEnvelope {
                 return false;
             }
         };
-        println!("signature_data {:?} {}", signature_data, signature_data.len());
+        //println!("signature_data {:?} {}", signature_data, signature_data.len());
         match public_key.verify::<Sha512>(&signature_data, &signature) {
             Ok(_) => true,
             Err(e) => {

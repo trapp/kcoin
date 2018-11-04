@@ -16,6 +16,12 @@ use std::time;
 use jsonrpc_minihttp_server::{ServerBuilder, DomainsValidation};
 use jsonrpc_minihttp_server::jsonrpc_core::{Params, Value, IoHandler, Compatibility, Error};
 use jsonrpc_minihttp_server::cors::AccessControlAllowOrigin;
+use block;
+
+pub const BLOCK_SIZE: u32 = 100;
+pub const BLOCK_TIME: u32 = 30000;
+pub const MEMPOOL_SIZE: u32 = 5000;
+pub const NEW_COIN_FEE: u64 = 10;
 
 #[derive(Debug, Fail)]
 pub enum KCoinError {
@@ -45,10 +51,9 @@ impl Network {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone)]
 pub struct Bech32Address {
     pub address: String,
-    #[serde(skip)]
     pub network: Network
 }
 
@@ -79,12 +84,8 @@ impl Bech32Address {
                 if address.hrp() != self.network.prefix() {
                     return Err(KCoinError::InvalidAddress);
                 }
-                //let data = Vec<u8>::from_base32(address.data());
-                println!("data {:?}", address.data());
                 let data = convert_bits(address.data(), 5, 8, false).map_err(|_| KCoinError::InvalidAddress)?;
-                println!("data converted {:?}", address.data());
                 let data_slice = data.as_slice();
-                println!("data as slice {:?}", data_slice);
                 let key = PublicKey::from_bytes(data_slice).map_err(|_| KCoinError::InvalidAddress)?;
                 Ok(key)
             },
@@ -210,17 +211,18 @@ pub fn init() -> Result<(), KCoinError> {
 
     {
         let block_gen_storage = storage.clone();
+        let network_clone = network.clone();
         let block_gen_thread = thread::spawn(move || {
-            const BLOCK_SIZE: u64 = 2;
             loop {
-                let ten_seconds = time::Duration::from_millis(30000);
+                match block::generate(&block_gen_storage, &network) {
+                    Ok(_) => {},
+                    Err(e) => {
+                        println!("Error during block production: {:?}", e);
+                    }
+                }
+
+                let ten_seconds = time::Duration::from_millis(BLOCK_TIME.into());
                 thread::sleep(ten_seconds);
-
-                println!("gen block");
-
-                // fetch mempool txs ordered by fee limit block size
-
-                //
             }
         });
     }
