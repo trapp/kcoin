@@ -8,7 +8,7 @@ use storage;
 use kcoin::Bech32Address;
 use kcoin::Network;
 
-pub fn mempool_get_stats(storage: &SqliteStorage, network: &Network) -> Result<Value> {
+pub fn mempool_get_stats(storage: &SqliteStorage, network: &Network, mempool_size: u64, block_size: u64, block_time: u64) -> Result<Value> {
     debug!("Received call to mempool_getStats");
 
     let stats = storage.mempool_get_stats(network).map_err(internal_error)?;
@@ -17,7 +17,10 @@ pub fn mempool_get_stats(storage: &SqliteStorage, network: &Network) -> Result<V
         "count": stats.count,
         "min_fee": stats.min_fee,
         "max_fee": stats.max_fee,
-        "avg_fee": stats.avg_fee
+        "avg_fee": stats.avg_fee,
+        "size": mempool_size,
+        "block_size": block_size,
+        "block_time": block_time
     });
     Ok(result)
 }

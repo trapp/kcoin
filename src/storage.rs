@@ -653,7 +653,7 @@ impl SqliteStorage {
 
         conn
             .query_row_and_then(
-                "SELECT COUNT(*), IFNULL(MIN(fee), 0), IFNULL(MAX(fee),0), IFNULL(AVG(fee),0) FROM `mempool` m",
+                "SELECT COUNT(*), IFNULL(MIN(fee), 0), IFNULL(MAX(fee),0), CAST(ROUND(IFNULL(AVG(fee),0)) as int) FROM `mempool` m",
                 NO_PARAMS,
                 |row| {
                     Ok(MempoolStats {
@@ -724,7 +724,7 @@ impl SqliteStorage {
             println!("{:?}", e);
             Error::QueryError {message: "unable to deduct fee from senders balance".to_owned()}
         })?;
-        if fee_from_changed == 0 {
+        if fee_from_changed == 0 && transaction.tx.fee > 0 {
             return Err(Error::QueryError {message: "unable to deduct fee from senders balance".to_owned()});
         }
 

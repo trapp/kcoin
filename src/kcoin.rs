@@ -288,8 +288,11 @@ pub fn init() -> Result<(), KCoinError> {
     {
         let storage_clone = storage.clone();
         let network_clone = network.clone();
+        let mempool_size_clone = mempool_size;
+        let block_size_clone = block_size;
+        let block_time_clone = block_time;
         io.add_method("mempool_getStats", move |_| {
-            rpccalls::mempool::mempool_get_stats(&storage_clone, &network_clone)
+            rpccalls::mempool::mempool_get_stats(&storage_clone, &network_clone, mempool_size_clone, block_size_clone, block_time_clone)
         });
     }
 
