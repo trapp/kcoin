@@ -17,11 +17,9 @@ use jsonrpc_minihttp_server::{ServerBuilder, DomainsValidation};
 use jsonrpc_minihttp_server::jsonrpc_core::{Params, Value, IoHandler, Compatibility, Error};
 use jsonrpc_minihttp_server::cors::AccessControlAllowOrigin;
 use block;
+use serde::{Serialize, Serializer};
 
-pub const BLOCK_SIZE: u32 = 100;
-pub const BLOCK_TIME: u32 = 30000;
-pub const MEMPOOL_SIZE: u32 = 5000;
-pub const NEW_COIN_FEE: u64 = 10;
+pub const NEW_COIN_FEE: u64 = 1000000000;
 
 #[derive(Debug, Fail)]
 pub enum KCoinError {
@@ -55,6 +53,15 @@ impl Network {
 pub struct Bech32Address {
     pub address: String,
     pub network: Network
+}
+
+impl Serialize for Bech32Address {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.address)
+    }
 }
 
 impl Bech32Address {
@@ -148,6 +155,27 @@ pub fn init() -> Result<(), KCoinError> {
             .help("How many KCNs get created initially")
             .takes_value(true)
             .default_value("100000000"))
+        .arg(Arg::with_name("block-time")
+            .short("t")
+            .long("block-time")
+            .value_name("SECONDS")
+            .help("After how many seconds a new block should get crafted")
+            .takes_value(true)
+            .default_value("60"))
+        .arg(Arg::with_name("mempool-size")
+            .short("m")
+            .long("mempool-size")
+            .value_name("NUMBER")
+            .help("How many transactions the mempool can fit")
+            .takes_value(true)
+            .default_value("5000"))
+        .arg(Arg::with_name("block-size")
+            .short("b")
+            .long("block-size")
+            .value_name("NUMBER")
+            .help("How many transactions the each block can fit")
+            .takes_value(true)
+            .default_value("100"))
         .arg(Arg::with_name("regtest")
             .short("r")
             .long("regtest")
@@ -167,36 +195,44 @@ pub fn init() -> Result<(), KCoinError> {
 
     let regtest = matches.is_present("regtest");
     debug!("Value for regtest: {}", regtest);
-    if regtest == true {
-        info!("Regtest mode enabled. Automated block production has been disabled.");
-        io.add_method("regtest_generate", move |params| {
-            rpccalls::regtest::regtest_generate(param_map(params)?)
-        });
-    }
 
     let network = match regtest {
         false => Network::Mainnet,
         true => Network::Regtest
     };
 
+    debug!("{:?}", matches.value_of("kcn-address"));
     let kcn_address = Bech32Address::new(matches.value_of("kcn-address").unwrap(), network.clone()).map_err(|e| KCoinError::InvalidArgument { argument: "kcn-address".to_owned(), reason: e.to_string()})?;
     debug!("Value for kcn-address: {:?}", kcn_address);
 
     let kcn_supply: u64 = matches.value_of("kcn-supply").unwrap_or_default().parse().map_err(|e: ParseIntError| KCoinError::InvalidArgument{ argument: "kcn-supply".to_owned(), reason: e.to_string()})?;
     debug!("Value for kcn-supply: {}", kcn_supply);
 
-    let storage = match regtest {
-        true => {
-            storage::SqliteStorage::new(None, kcn_address, kcn_supply).unwrap()
-        },
-        false => {
-            storage::SqliteStorage::new(Some(&Path::new(datadir)), kcn_address, kcn_supply).unwrap()
-        }
-    };
+    let block_time: u64 = matches.value_of("block-time").unwrap_or_default().parse().map_err(|e: ParseIntError| KCoinError::InvalidArgument{ argument: "block-time".to_owned(), reason: e.to_string()})?;
+    debug!("Value for block-time: {}", block_time);
+
+    let block_size: u64 = matches.value_of("block-size").unwrap_or_default().parse().map_err(|e: ParseIntError| KCoinError::InvalidArgument{ argument: "block-size".to_owned(), reason: e.to_string()})?;
+    debug!("Value for block-size: {}", block_size);
+
+    let mempool_size: u64 = matches.value_of("mempool-size").unwrap_or_default().parse().map_err(|e: ParseIntError| KCoinError::InvalidArgument{ argument: "mempool-size".to_owned(), reason: e.to_string()})?;
+    debug!("Value for mempool-size: {}", mempool_size);
+
+    let storage = storage::SqliteStorage::new(&Path::new(datadir), regtest, kcn_address, kcn_supply).unwrap();
+
+    if regtest == true {
+        info!("Regtest mode enabled. Automated block production has been disabled.");
+
+        let block_gen_storage = storage.clone();
+        let network_clone = network.clone();
+        let block_size_clone = block_size;
+        io.add_method("regtest_generate", move |_| {
+            rpccalls::regtest::regtest_generate(&block_gen_storage, block_size_clone, &network_clone)
+        });
+    }
 
     {
         let storage_clone = storage.clone();
-        io.add_method("chain_height", move |_| {
+        io.add_method("chain_getHeight", move |_| {
             rpccalls::chain::chain_height(&storage_clone)
         });
     }
@@ -204,25 +240,83 @@ pub fn init() -> Result<(), KCoinError> {
     {
         let storage_clone = storage.clone();
         let network_clone = network.clone();
-        io.add_method("tx_send", move |params| {
-            rpccalls::tx::tx_send(&storage_clone, &network_clone, param_map(params)?)
+        io.add_method("chain_getBlockByHeight", move |params| {
+            rpccalls::chain::chain_get_block_by_height(&storage_clone, param_map(params)?, &network_clone)
         });
     }
 
     {
+        let storage_clone = storage.clone();
+        let network_clone = network.clone();
+        io.add_method("chain_addressInfo", move |params| {
+            rpccalls::chain::chain_address_info(&storage_clone, param_map(params)?, &network_clone)
+        });
+    }
+
+    {
+        let storage_clone = storage.clone();
+        let network_clone = network.clone();
+        io.add_method("mempool_getTransactions", move |params| {
+            rpccalls::mempool::mempool_get_transactions(&storage_clone, &network_clone, param_map(params)?)
+        });
+    }
+
+    {
+        let storage_clone = storage.clone();
+        let network_clone = network.clone();
+        io.add_method("mempool_getTransactionByHash", move |params| {
+            rpccalls::mempool::mempool_get_transaction_by_hash(&storage_clone, &network_clone, param_map(params)?)
+        });
+    }
+
+    {
+        let storage_clone = storage.clone();
+        let network_clone = network.clone();
+        io.add_method("chain_getTransactions", move |params| {
+            rpccalls::chain::chain_get_transactions(&storage_clone, &network_clone, param_map(params)?)
+        });
+    }
+
+    {
+        let storage_clone = storage.clone();
+        let network_clone = network.clone();
+        io.add_method("chain_getTransactionByHash", move |params| {
+            rpccalls::chain::chain_get_transaction_by_hash(&storage_clone, &network_clone, param_map(params)?)
+        });
+    }
+
+    {
+        let storage_clone = storage.clone();
+        let network_clone = network.clone();
+        io.add_method("mempool_getStats", move |_| {
+            rpccalls::mempool::mempool_get_stats(&storage_clone, &network_clone)
+        });
+    }
+
+    {
+        let storage_clone = storage.clone();
+        let network_clone = network.clone();
+        let mempool_size_clone = mempool_size;
+        io.add_method("tx_send", move |params| {
+            rpccalls::tx::tx_send(&storage_clone, &network_clone, mempool_size_clone, param_map(params)?)
+        });
+    }
+
+
+    if regtest == false {
         let block_gen_storage = storage.clone();
         let network_clone = network.clone();
+        let block_size_clone = block_size;
         let block_gen_thread = thread::spawn(move || {
             loop {
-                match block::generate(&block_gen_storage, &network) {
+                match block::generate(&block_gen_storage, block_size_clone, &network) {
                     Ok(_) => {},
                     Err(e) => {
                         println!("Error during block production: {:?}", e);
                     }
                 }
 
-                let ten_seconds = time::Duration::from_millis(BLOCK_TIME.into());
-                thread::sleep(ten_seconds);
+                thread::sleep(time::Duration::from_millis((block_time * 1000).into()));
             }
         });
     }

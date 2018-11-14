@@ -69,22 +69,42 @@ pub struct SqliteStorage {
     knc_address: Bech32Address
 }
 
+pub struct Balance {
+    pub coin: String,
+    pub balance: u64
+}
+
+pub struct MempoolStats {
+    pub count: u32,
+    pub min_fee: u32,
+    pub max_fee: u32,
+    pub avg_fee: u32
+}
+
 impl SqliteStorage {
-    pub fn new(dir: Option<&Path>, knc_address: Bech32Address, knc_supply: u64) -> Result<Self, Error> {
-        let manager = match dir {
-            Some(s) => {
-                if !s.exists() {
-                    println!("{:?}", s);
-                    fs::create_dir(&s).map_err(|_| Error::DataDirNotWriteable) ?;
+    pub fn new(dir: &Path, regtest: bool, knc_address: Bech32Address, knc_supply: u64) -> Result<Self, Error> {
+        let manager = match regtest {
+            false => {
+                if !dir.exists() {
+                    println!("{:?}", dir);
+                    fs::create_dir(&dir).map_err(|_| Error::DataDirNotWriteable) ?;
                 }
-                let mut db_file_name = s.to_path_buf();
+                let mut db_file_name = dir.to_path_buf();
                 db_file_name.push("db.sqlite3");
                 let db_path = db_file_name.as_path();
 
                 SqliteConnectionManager::file(db_path)
             },
-            None => {
-                SqliteConnectionManager::memory()
+            true => {
+                if !dir.exists() {
+                    println!("{:?}", dir);
+                    fs::create_dir(&dir).map_err(|_| Error::DataDirNotWriteable) ?;
+                }
+                let mut db_file_name = dir.to_path_buf();
+                db_file_name.push("db-regtest.sqlite3");
+                let db_path = db_file_name.as_path();
+
+                SqliteConnectionManager::file(db_path)
             }
         };
         let pool = Pool::new(manager).map_err(|_| Error::CannotOpenDb)?;
@@ -167,6 +187,221 @@ impl SqliteStorage {
             }
         };
         Ok(height)
+    }
+
+    pub fn block_get_by_height(&self, height: u32) -> Result<Block, Error> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn
+            .prepare("SELECT `height`, `hash`, `time` FROM `block` WHERE `height` = ?1 LIMIT 1")
+            .map_err(|e| Error::QueryError {message: e.to_string()})?;
+
+        let block = conn.query_row_and_then(
+            "SELECT `height`, `hash`, `time` FROM `block` WHERE `height` = ?1 LIMIT 1",
+            &[height],
+            |row| -> Result<Block, Error> {
+                Ok(Block {
+                    height: row.get_checked(0)?,
+                    hash: row.get_checked(1)?,
+                    time: row.get_checked(2)?
+                })
+            }
+        )?;
+
+        Ok(block)
+    }
+
+    pub fn chain_get_transactions(&self, height: Option<u32>, after_height: Option<u32>, from: Option<Bech32Address>, to: Option<Bech32Address>, limit: u32, network: &Network) -> Result<Vec<MinedTx>, Error> {
+        let conn = self.get_conn()?;
+
+        // `hash` TEXT, `signature` TEXT, `block` INTEGER, `index` INTEGER, `seen` INTEGER,
+        // `from` TEXT, `to` TEXT, `coin` TEXT, `amount` BIGINT, `nonce` BIGINT, `fee` BIGINT,
+        // `memo` TEXT
+
+        let mut whereVec = Vec::new();
+        let mut params = Vec::new();
+        params.push(limit.to_string());
+        match height {
+            Some(v) => {
+                let q = format!("`block` = ?{}", whereVec.len() + 2);
+                whereVec.push(q);
+                params.push(v.to_string());
+            },
+            None => {}
+        }
+
+        match from {
+            Some(v) => {
+                let q = format!("`from` = ?{}", whereVec.len() + 2);
+                whereVec.push(q);
+                params.push(v.address);
+            },
+            None => {}
+        }
+
+        match to {
+            Some(v) => {
+                let q = format!("`to` = ?{}", whereVec.len() + 2);
+                whereVec.push(q);
+                params.push(v.address);
+            },
+            None => {}
+        }
+
+        match after_height {
+            Some(v) => {
+                let q = format!("`block` > ?{}", whereVec.len() + 2);
+                whereVec.push(q);
+                params.push(v.to_string());
+            },
+            None => {}
+        }
+
+        if whereVec.len() == 0 {
+            whereVec.push("1".to_owned());
+        }
+
+        // "SELECT `amount`, `coin`, `fee`, `from`, `hash`, `memo`, `nonce`, `seen`, `signature`, `to` FROM `mempool` WHERE `from` = ?1 AND `nonce` = ?2 LIMIT 1",
+
+        let query = format!("SELECT `amount`, `coin`, `fee`, `from`, `hash`, `memo`, `nonce`, `seen`, `signature`, `to`, `block`, `index` \
+                  FROM `transaction` \
+                  WHERE {} \
+                  ORDER BY `index` ASC \
+                  LIMIT ?1", whereVec.join(" AND "));
+
+        let mut stmt = conn
+            .prepare(&query)
+            .map_err(|e| Error::QueryError {message: e.to_string()})?;
+
+        let rows = stmt
+            .query_and_then(
+                &params,
+                |row| -> Result<MinedTx, Error> {
+                    Ok(MinedTx {
+                        block: row.get_checked(10)?,
+                        index: row.get_checked(11)?,
+                        tx_envelope: SqliteStorage::tx_from_row(row, network)?
+                    })
+                })?;
+
+        let mut txs = Vec::new();
+        for tx in rows {
+            txs.push(tx?);
+        }
+        Ok(txs)
+    }
+
+    pub fn mempool_get_transactions(&self, after_seen: Option<u32>, from: Option<Bech32Address>, to: Option<Bech32Address>, limit: u32, network: &Network) -> Result<Vec<TransactionEnvelope>, Error> {
+        let conn = self.get_conn()?;
+
+        let mut whereVec = Vec::new();
+        let mut params = Vec::new();
+        params.push(limit.to_string());
+
+        match from {
+            Some(v) => {
+                let q = format!("`from` = ?{}", whereVec.len() + 2);
+                whereVec.push(q);
+                params.push(v.address);
+            },
+            None => {}
+        }
+
+        match to {
+            Some(v) => {
+                let q = format!("`to` = ?{}", whereVec.len() + 2);
+                whereVec.push(q);
+                params.push(v.address);
+            },
+            None => {}
+        }
+
+        match after_seen {
+            Some(v) => {
+                let q = format!("`seen` > ?{}", whereVec.len() + 2);
+                whereVec.push(q);
+                params.push(v.to_string());
+            },
+            None => {}
+        }
+
+        if whereVec.len() == 0 {
+            whereVec.push("1".to_owned());
+        }
+
+        let query = format!("SELECT `amount`, `coin`, `fee`, `from`, `hash`, `memo`, `nonce`, `seen`, `signature`, `to` \
+                  FROM `mempool` \
+                  WHERE {} \
+                  ORDER BY `seen` ASC \
+                  LIMIT ?1", whereVec.join(" AND "));
+
+        let mut stmt = conn
+            .prepare(&query)
+            .map_err(|e| Error::QueryError {message: e.to_string()})?;
+
+        let rows = stmt
+            .query_and_then(
+                &params,
+                |row| -> Result<TransactionEnvelope, Error> {
+                    Ok(SqliteStorage::tx_from_row(row, network)?)
+                })?;
+
+        let mut txs = Vec::new();
+        for tx in rows {
+            txs.push(tx?);
+        }
+        Ok(txs)
+    }
+
+    pub fn chain_get_transaction_by_hash(&self, network: &Network, hash: &str) -> Result<MinedTx, Error> {
+        let conn = self.get_conn()?;
+
+        let query = format!("SELECT `amount`, `coin`, `fee`, `from`, `hash`, `memo`, `nonce`, `seen`, `signature`, `to`, `block`, `index` \
+                  FROM `transaction` \
+                  WHERE hash = ?");
+
+        let mut stmt = conn
+            .prepare(&query)
+            .map_err(|e| Error::QueryError {message: e.to_string()})?;
+
+        let rows = stmt
+            .query_and_then(
+                &[hash],
+                |row| -> Result<MinedTx, Error> {
+                    Ok(MinedTx {
+                        block: row.get_checked(10)?,
+                        index: row.get_checked(11)?,
+                        tx_envelope: SqliteStorage::tx_from_row(row, network)?
+                    })
+                })?;
+
+        for tx in rows {
+            return Ok(tx?);
+        }
+        Err(Error::NotFound)
+    }
+
+    pub fn mempool_get_transaction_by_hash(&self, network: &Network, hash: &str) -> Result<TransactionEnvelope, Error> {
+        let conn = self.get_conn()?;
+
+        let query = format!("SELECT `amount`, `coin`, `fee`, `from`, `hash`, `memo`, `nonce`, `seen`, `signature`, `to` \
+                  FROM `mempool` \
+                  WHERE hash = ?");
+
+        let mut stmt = conn
+            .prepare(&query)
+            .map_err(|e| Error::QueryError {message: e.to_string()})?;
+
+        let rows = stmt
+            .query_and_then(
+                &[hash],
+                |row| -> Result<TransactionEnvelope, Error> {
+                    Ok(SqliteStorage::tx_from_row(row, network)?)
+                })?;
+
+        for tx in rows {
+            return Ok(tx?);
+        }
+        Err(Error::NotFound)
     }
 
     pub fn address_nonce_mined(&self, address: &Bech32Address) -> Result<Option<u64>, Error> {
@@ -339,7 +574,7 @@ impl SqliteStorage {
         Ok(TransactionEnvelope {
             hash: row.get_checked(4)?,
             signature: row.get_checked(8)?,
-            seen: Timespec::new(row.get_checked(7)?, 0),
+            seen: row.get_checked(7)?,
             tx: Transaction {
                 amount: SqliteStorage::i64_to_u64(row.get_checked(0)?)?,
                 coin: row.get_checked(1)?,
@@ -389,7 +624,7 @@ impl SqliteStorage {
         }
     }
 
-    pub fn mempool_get_block_candidates(&self, network: &Network) -> Result<Vec<TransactionEnvelope>, Error> {
+    pub fn mempool_get_block_candidates(&self, block_size: u64, network: &Network) -> Result<Vec<TransactionEnvelope>, Error> {
         let conn = self.get_conn()?;
         let mut stmt = conn
             .prepare("SELECT `amount`, `coin`, `fee`, `from`, `hash`, `memo`, `nonce`, `seen`, `signature`, `to` \
@@ -401,7 +636,7 @@ impl SqliteStorage {
         //select * from mempool m order by (nonce - ifnull((select nonce from `transaction` t where m."from" = t."from" order by nonce desc limit 1), 0)) ASC, fee desc;
         let rows = stmt
             .query_and_then(
-                &[::kcoin::BLOCK_SIZE],
+                &[block_size as u32],
                 |row| {
                     SqliteStorage::tx_from_row(row, network)
                 })?;
@@ -411,6 +646,23 @@ impl SqliteStorage {
             txs.push(tx?);
         }
         Ok(txs)
+    }
+
+    pub fn mempool_get_stats(&self, network: &Network) -> Result<MempoolStats, Error> {
+        let conn = self.get_conn()?;
+
+        conn
+            .query_row_and_then(
+                "SELECT COUNT(*), IFNULL(MIN(fee), 0), IFNULL(MAX(fee),0), IFNULL(AVG(fee),0) FROM `mempool` m",
+                NO_PARAMS,
+                |row| {
+                    Ok(MempoolStats {
+                        count: row.get_checked(0)?,
+                        min_fee: row.get_checked(1)?,
+                        max_fee: row.get_checked(2)?,
+                        avg_fee: row.get_checked(3)?
+                    })
+                })
     }
 
     pub fn start_transaction(&self, conn: &rusqlite::Connection) -> Result<(), Error> {
@@ -442,7 +694,7 @@ impl SqliteStorage {
                 &transaction.signature,
                 &block.to_string(),
                 &index.to_string(),
-                &transaction.seen.sec.to_string(),
+                &transaction.seen.to_string(),
                 &transaction.tx.from.address.to_string(),
                 &transaction.tx.to.address.to_string(),
                 &transaction.tx.coin.to_string(),
@@ -488,14 +740,14 @@ impl SqliteStorage {
             println!("{:?}", e);
             Error::QueryError {message: "insert tx failed".to_owned()}
         })?;
-        if from_changed == 0 && self.coin_exists_in_chain(&transaction.tx.coin)? {
+        if from_changed == 0 && self.coin_exists_in_chain_with_conn(&conn, &transaction.tx.coin)? {
             return Err(Error::QueryError {message: "sender has not enough balance".to_owned()});
         }
 
         println!("autocommit after updating sender balance {:?}", conn.is_autocommit());
 
         // Add amount to receivers balance
-        match self.address_get_balance(&transaction.tx.to.address, &transaction.tx.coin)? {
+        match self.address_get_balance_with_conn(&conn, &transaction.tx.to.address, &transaction.tx.coin)? {
             Some(_) => {
                 let to_changed = conn.execute(
                     "UPDATE `address_balance` SET `balance` = `balance` + ?1 WHERE `address` = ?2 AND `coin` = ?3",
@@ -523,7 +775,7 @@ impl SqliteStorage {
                     ],
                 ).map_err(|e| {
                     println!("{:?}", e);
-                    Error::QueryError {message: "insert sender balance failed".to_owned()}
+                    Error::QueryError {message: "insert receiver balance failed".to_owned()}
                 })?;
 
                 if to_changed == 0 {
@@ -556,7 +808,10 @@ impl SqliteStorage {
 
     pub fn address_get_balance(&self, address: &str, coin: &str) -> Result<Option<u64>, Error> {
         let conn = self.get_conn()?;
+        self.address_get_balance_with_conn(&conn, address, coin)
+    }
 
+    pub fn address_get_balance_with_conn(&self, conn: &rusqlite::Connection, address: &str, coin: &str) -> Result<Option<u64>, Error> {
         match conn
             .query_row_and_then(
                 "SELECT balance FROM `address_balance` where `address` = ?1 and `coin` = ?2",
@@ -572,6 +827,54 @@ impl SqliteStorage {
                 }
             }
         }
+    }
+
+    pub fn address_get_balances(&self, address: &Bech32Address) -> Result<Vec<Balance>, Error> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare("SELECT coin, balance FROM `address_balance` where `address` = ?1")
+            .map_err(|e| Error::QueryError {message: e.to_string()})?;
+
+        let rows = stmt
+            .query_and_then(
+                &[&address.address],
+                |row| -> Result<Balance, Error> {
+                    Ok(Balance {
+                        coin: row.get_checked(0)?,
+                        balance: SqliteStorage::i64_to_u64(row.get_checked(1)?)?
+                    })
+                })?;
+
+        let mut results = Vec::new();
+        for result in rows {
+            results.push(result?);
+        }
+        Ok(results)
+    }
+
+    pub fn address_get_reserved_balances(&self, address: &Bech32Address) -> Result<Vec<Balance>, Error> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare("SELECT `coin`, SUM(`amount`) + SUM(`fee`) as `reserved` FROM `mempool` where `from` = ?1 GROUP BY `coin`")
+            .map_err(|e| Error::QueryError {message: e.to_string()})?;
+
+        let rows = stmt
+            .query_and_then(
+                &[&address.address],
+                |row| -> Result<Balance, Error> {
+                    Ok(Balance {
+                        coin: row.get_checked(0)?,
+                        balance: SqliteStorage::i64_to_u64(row.get_checked(1)?)?
+                    })
+                })?;
+
+        let mut results = Vec::new();
+        for result in rows {
+            results.push(result?);
+        }
+        Ok(results)
     }
 
     pub fn address_get_reserved_balance(&self, address: &str, coin: &str) -> Result<Option<u64>, Error> {
@@ -598,9 +901,7 @@ impl SqliteStorage {
         Ok(self.coin_exists_in_chain(coin)? || self.coin_exists_in_mempool(coin)?)
     }
 
-    pub fn coin_exists_in_chain(&self, coin: &str) -> Result<bool, Error> {
-        let conn = self.get_conn()?;
-
+    pub fn coin_exists_in_chain_with_conn(&self, conn: &rusqlite::Connection, coin: &str) -> Result<bool, Error> {
         match conn
             .query_row_and_then(
                 "SELECT `balance` from `address_balance` a where a.coin = ?1 LIMIT 1",
@@ -617,6 +918,11 @@ impl SqliteStorage {
                 }
             }
         }
+    }
+
+    pub fn coin_exists_in_chain(&self, coin: &str) -> Result<bool, Error> {
+        let conn = self.get_conn()?;
+        self.coin_exists_in_chain_with_conn(&conn, coin)
     }
 
     pub fn coin_exists_in_mempool(&self, coin: &str) -> Result<bool, Error> {
@@ -648,7 +954,7 @@ impl SqliteStorage {
             &[
                 &block.height.to_string(),
                 &block.hash,
-                &block.time.sec.to_string()
+                &block.time.to_string()
             ],
         ).map_err(|e| {
             println!("{:?}", e);

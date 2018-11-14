@@ -3,6 +3,7 @@ extern crate jsonrpc_minihttp_server;
 pub mod regtest;
 pub mod chain;
 pub mod tx;
+pub mod mempool;
 use jsonrpc_minihttp_server::jsonrpc_core::*;
 
 fn get_string<'a>(params: &'a serde_json::Map<String, Value>, name: &str) -> Result<&'a str> {

@@ -14,13 +14,19 @@ use rusqlite::Connection;
 pub struct Block {
     pub height: u32,
     pub hash: String,
-    pub time: Timespec
+    pub time: i64
 }
 
-pub fn generate(storage: &SqliteStorage, network: &Network) -> Result<(), Error> {
+#[derive(Debug)]
+pub struct BlockWithTransactions {
+    pub block: Block,
+    pub txs: Vec<TransactionEnvelope>
+}
+
+pub fn generate(storage: &SqliteStorage, block_size: u64, network: &Network) -> Result<(), Error> {
     let conn = storage.get_conn()?;
     println!("gen block");
-    let txs = storage.mempool_get_block_candidates(network)?;
+    let txs = storage.mempool_get_block_candidates(block_size, network)?;
 
     if txs.len() == 0 {
         // No transactions available. No need for a block.
@@ -60,10 +66,10 @@ fn generate_with_conn(storage: &SqliteStorage, conn: &Connection, txs: &Vec<Tran
     // sanity balance check
     storage.balance_sanity_check_with_conn(&conn)?;
 
-    let time = time::get_time();
+    let time = time::get_time().sec;
     let addition_json = json!({
         "height": height,
-        "time": time.sec
+        "time": time
     });
 
     println!("addition {:?}", addition_json.to_string());

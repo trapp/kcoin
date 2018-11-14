@@ -23,7 +23,7 @@ pub enum Error {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct Transaction {
     pub amount: u64,
     pub coin: String,
@@ -56,19 +56,19 @@ impl Transaction {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct TransactionEnvelope {
     pub hash: String,
     pub signature: String,
-    pub seen: Timespec,
+    pub seen: i64,
     pub tx: Transaction
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct MinedTx {
     pub block: u32,
     pub index: u32,
-    pub tx: TransactionEnvelope
+    pub tx_envelope: TransactionEnvelope
 }
 
 impl TransactionEnvelope {
@@ -134,7 +134,7 @@ impl TransactionEnvelope {
         let envelope = TransactionEnvelope {
             hash: hash,
             signature: signature,
-            seen: time::get_time(),
+            seen: time::get_time().sec,
             tx: Transaction {
                 amount,
                 coin,

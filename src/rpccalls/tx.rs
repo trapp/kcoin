@@ -10,7 +10,7 @@ use ::kcoin::Network;
 use ::tx::TransactionEnvelope;
 use ::storage;
 
-pub fn tx_send(storage: &SqliteStorage, network: &Network, params: serde_json::Map<String, Value>) -> Result<Value> {
+pub fn tx_send(storage: &SqliteStorage, network: &Network, mempool_size: u64, params: serde_json::Map<String, Value>) -> Result<Value> {
     debug!("Received call to tx_send");
     println!("{:?}", params);
     let tx = TransactionEnvelope::from_json(params, network).map_err(|e| {
@@ -127,7 +127,7 @@ pub fn tx_send(storage: &SqliteStorage, network: &Network, params: serde_json::M
 
     let mempool_count = storage.mempool_count().map_err(internal_error)?;
     println!("mempool count {:?}", mempool_count);
-    if mempool_count >= ::kcoin::MEMPOOL_SIZE.into() {
+    if mempool_count >= mempool_size.into() {
         // Mempool is full. See if it's worth it to evict another tx for this one.
         // To calculate this, we take the sum of all fees per address currently in the
         // mempool and compare that to the new tx's fee. If the fee value of the new tx is

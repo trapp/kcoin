@@ -15,6 +15,7 @@ pub fn mempool_full() -> Error { jsonrpc_error("Mempool is full and fee is too l
 pub fn mempool_full_own_txs() -> Error { jsonrpc_error("Mempool is filled exclusively with your transactions. Wait until some get mined.", -33011, None) }
 pub fn insufficient_balance() -> Error { jsonrpc_error("Insufficient balance", -33012, None) }
 pub fn fee_too_low() -> Error { jsonrpc_error("Fee too low", -33013, None) }
+pub fn not_found() -> Error { jsonrpc_error("Not found", -33014, None) }
 
 pub fn jsonrpc_error(message: &str, code: i64, data: Option<Value>) -> Error {
     Error {
